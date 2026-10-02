@@ -1,0 +1,9 @@
+{
+  "name": "quota-balancer",
+  "private": true,
+  "license": "MIT",
+  "description": "Rebalance Oh My Pi model roles from each provider's live quota pools.",
+  "omp": {
+    "extensions": ["./quota-balancer.ts"]
+  }
+}
