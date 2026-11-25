@@ -1,5 +1,7 @@
 """Pool coverage follows usage reports, not provider names."""
 
+import io
+import json
 import os
 import stat
 import sys
@@ -219,8 +221,8 @@ class SingleProviderAndFallbackTest(unittest.TestCase):
         provider = analysis["providers"][0]
         opus = _model("anthropic", "claude-opus-4-6")
         gem = _model("anthropic", "gemini-3.8-flash")
-        self.assertEqual([p["kind"] for p in balance.covering_pools(provider, opus, set())], ["included"])
-        self.assertEqual([p["kind"] for p in balance.covering_pools(provider, gem, set())], ["metered"])
+        self.assertEqual([p["kind"] for p in balance.covering_pools(provider, opus, {"claude"})], ["included"])
+        self.assertEqual([p["kind"] for p in balance.covering_pools(provider, gem, {"claude"})], ["metered"])
 
     def test_exhausted_named_flash_yields_to_open_pool(self):
         usage = {
@@ -336,6 +338,10 @@ class SingleProviderAndFallbackTest(unittest.TestCase):
             self.assertEqual(leftovers, [])
 
     def test_apply_profile_returns_false_when_missing_default(self):
+        try:
+            import yaml  # noqa: F401
+        except ImportError:
+            self.skipTest("PyYAML not installed")
         with tempfile.TemporaryDirectory() as tmp:
             cfg = Path(tmp) / "config.yml"
             cfg.write_text("modelRoles:\n  default: keep/me\n")
@@ -349,6 +355,84 @@ class SingleProviderAndFallbackTest(unittest.TestCase):
                 ok = balance.apply_profile(bad_profile, quiet=True)
             self.assertFalse(ok)
             self.assertIn("keep/me", cfg.read_text())
+
+    def test_revision_handles_iso_dates_and_hyphenated_identity_revision(self):
+        iso_gpt = _model("p", "gpt-5-2025-08-07")
+        minor_gpt = _model("p", "gpt-5.2")
+        iso_41 = _model("p", "gpt-4.1-2025-04-14")
+        patch_41 = _model("p", "gpt-4.1.2")
+        self.assertGreater(balance._revision(minor_gpt), balance._revision(iso_gpt))
+        self.assertGreater(balance._revision(patch_41), balance._revision(iso_41))
+        hyphen_rev = balance._normalize_model({
+            "provider": "p",
+            "id": "custom",
+            "identity": {"revision": "4-6"},
+        })
+        self.assertEqual(balance._revision(hyphen_rev), (4, 6, 0, 0))
+
+    def test_load_catalog_accepts_json_list_stdin(self):
+        payload = json.dumps([{"provider": "p", "id": "m-1", "thinking": ["high"]}])
+        fake_stdin = io.StringIO(payload)
+        fake_stdin.isatty = lambda: False
+        with mock.patch.object(sys, "stdin", fake_stdin):
+            loaded = balance.load_catalog()
+        self.assertEqual(len(loaded), 1)
+        self.assertEqual(loaded[0]["id"], "m-1")
+
+    def test_effortless_grok_has_no_self_loop_in_fallback_chains(self):
+        usage = {
+            "reports": [
+                {
+                    "provider": "alpha",
+                    "limits": [_limit("alpha:inc", "Alpha Models", "monthly", 0.10)],
+                }
+            ]
+        }
+        catalog = [
+            balance._normalize_model({"provider": "alpha", "id": "grok-4.7", "thinking": []}),
+            balance._normalize_model({"provider": "alpha", "id": "grok-4.6", "thinking": []}),
+            balance._normalize_model({"provider": "alpha", "id": "composer-2.5-fast", "thinking": []}),
+        ]
+        analysis = balance.analyze_quotas(usage)
+        profiles = balance.generate_profiles(analysis, catalog)
+        for name in ("grok-power", "balanced", "conserve-cursor", "claude-first"):
+            for target, hops in profiles[name]["fallbackChains"].items():
+                self.assertNotIn(target, hops, f"{name} chain {target} loops onto itself")
+
+    def test_metered_flash_yields_to_general_flash_and_included_composer_fast(self):
+        usage = {
+            "reports": [
+                {
+                    "provider": "alpha",
+                    "limits": [
+                        _limit("alpha:inc", "Alpha Models", "monthly", 0.20),
+                        _limit("alpha:other", "Other Models", "monthly", 0.05, unit="usd", used=1, limit=20),
+                    ],
+                },
+                {
+                    "provider": "beta",
+                    "limits": [_limit("beta:gemini", "Gemini", "5h", 1.0)],
+                },
+                {
+                    "provider": "gamma",
+                    "limits": [_limit("gamma:req", "Requests", "monthly", 0.30)],
+                },
+            ]
+        }
+        catalog = [
+            _model("alpha", "gemini-3.8-flash"),
+            _model("alpha", "composer-2.5-fast"),
+            _model("beta", "gemini-3.8-flash"),
+            _model("gamma", "gemini-3.8-flash"),
+        ]
+        analysis = balance.analyze_quotas(usage)
+        flash = balance._pick_flash(catalog, analysis["providers"], balance.explicit_families(analysis))
+        self.assertEqual(flash["provider"]["id"], "gamma")
+
+        # Without gamma, alpha's gemini is metered so routine work prefers alpha's included composer-fast.
+        no_gamma_analysis = balance.analyze_quotas({"reports": usage["reports"][:2]})
+        no_gamma_profiles = balance.generate_profiles(no_gamma_analysis, catalog[:3])
+        self.assertEqual(no_gamma_profiles["balanced"]["modelRoles"]["default"], "alpha/composer-2.5-fast")
 
 
 if __name__ == "__main__":
