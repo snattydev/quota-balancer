@@ -1,8 +1,14 @@
 """Pool coverage follows usage reports, not provider names."""
 
+import io
+import json
+import os
+import stat
 import sys
+import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "scripts"))
 import balance  # noqa: E402
@@ -168,6 +174,265 @@ class FractionTest(unittest.TestCase):
     def test_explicit_fraction_wins(self):
         limit = {"amount": {"used": 9.0, "usedFraction": 0.25, "unit": "percent"}}
         self.assertAlmostEqual(balance._used_fraction(limit), 0.25)
+
+
+class SingleProviderAndFallbackTest(unittest.TestCase):
+    def test_single_provider_routes_metered_families_without_second_provider(self):
+        usage = {
+            "reports": [
+                {
+                    "provider": "alpha",
+                    "limits": [
+                        _limit("alpha:included", "Alpha Models", "monthly", 0.85),
+                        _limit("alpha:other", "Other Models", "monthly", 1.0, unit="usd", used=20, limit=20),
+                    ],
+                }
+            ]
+        }
+        analysis = balance.analyze_quotas(usage)
+        explicit = balance.explicit_families(analysis)
+        self.assertEqual(explicit, set())
+        alpha = analysis["providers"][0]
+
+        opus = next(m for m in CATALOG if m["provider"] == "alpha" and "opus" in m["id"])
+        gem = next(m for m in CATALOG if m["provider"] == "alpha" and "gemini" in m["id"])
+        grok = next(m for m in CATALOG if m["provider"] == "alpha" and m["id"] == "grok-4.7")
+        self.assertEqual([p["kind"] for p in balance.covering_pools(alpha, opus, explicit)], ["metered"])
+        self.assertEqual([p["kind"] for p in balance.covering_pools(alpha, gem, explicit)], ["metered"])
+        self.assertEqual([p["kind"] for p in balance.covering_pools(alpha, grok, explicit)], ["included"])
+
+        profiles = balance.generate_profiles(analysis, CATALOG)
+        self.assertFalse(profiles["claude-first"]["claude_active"])
+        self.assertEqual(profiles["recommended"], "balanced")
+
+    def test_provider_own_family_stays_on_included_pool(self):
+        usage = {
+            "reports": [
+                {
+                    "provider": "anthropic",
+                    "limits": [
+                        _limit("anth:included", "Included Models", "monthly", 0.20),
+                        _limit("anth:other", "Other Models", "monthly", 0.99, unit="usd", used=19.8, limit=20),
+                    ],
+                }
+            ]
+        }
+        analysis = balance.analyze_quotas(usage)
+        provider = analysis["providers"][0]
+        opus = _model("anthropic", "claude-opus-4-6")
+        gem = _model("anthropic", "gemini-3.8-flash")
+        self.assertEqual([p["kind"] for p in balance.covering_pools(provider, opus, {"claude"})], ["included"])
+        self.assertEqual([p["kind"] for p in balance.covering_pools(provider, gem, {"claude"})], ["metered"])
+
+    def test_exhausted_named_flash_yields_to_open_pool(self):
+        usage = {
+            "reports": [
+                {
+                    "provider": "beta",
+                    "limits": [_limit("beta:gemini", "Gemini", "5h", 1.0)],
+                },
+                {
+                    "provider": "gamma",
+                    "limits": [_limit("gamma:req", "Requests", "monthly", 0.10)],
+                },
+            ]
+        }
+        catalog = [
+            _model("beta", "gemini-3.8-flash"),
+            _model("gamma", "gemini-3.8-flash"),
+        ]
+        analysis = balance.analyze_quotas(usage)
+        flash = balance._pick_flash(catalog, analysis["providers"], balance.explicit_families(analysis))
+        self.assertEqual(flash["provider"]["id"], "gamma")
+
+    def test_available_usd_grok_beats_exhausted_percent_grok(self):
+        usage = {
+            "reports": [
+                {
+                    "provider": "pct",
+                    "limits": [_limit("pct:inc", "Pct Models", "monthly", 0.91, unit="percent")],
+                },
+                {
+                    "provider": "usd",
+                    "limits": [_limit("usd:inc", "Usd Models", "monthly", 0.92, unit="usd", used=18.4, limit=20)],
+                },
+            ]
+        }
+        catalog = [
+            _model("pct", "grok-4.7"),
+            _model("usd", "grok-4.7"),
+        ]
+        analysis = balance.analyze_quotas(usage)
+        grok = balance._pick_grok(catalog, analysis["providers"], set())
+        self.assertEqual(grok["provider"]["id"], "usd")
+        self.assertTrue(grok["available"])
+
+    def test_generic_provider_without_grok_or_claude_populates_roles(self):
+        usage = {
+            "reports": [
+                {
+                    "provider": "delta",
+                    "limits": [_limit("delta:req", "Requests", "monthly", 0.25)],
+                }
+            ]
+        }
+        catalog = [
+            _model("delta", "gpt-5"),
+            _model("delta", "gpt-5-mini"),
+        ]
+        analysis = balance.analyze_quotas(usage)
+        profiles = balance.generate_profiles(analysis, catalog)
+        rec = profiles[profiles["recommended"]]
+        self.assertEqual(rec["modelRoles"]["default"], "delta/gpt-5-mini")
+        self.assertEqual(rec["modelRoles"]["slow"], "delta/gpt-5:high")
+
+    def test_revision_and_claude_matching(self):
+        dated = _model("p", "claude-sonnet-4-20250514")
+        older_dated = _model("p", "claude-sonnet-4-20250219")
+        minor = _model("p", "claude-sonnet-4-6")
+        legacy = _model("p", "claude-3-5-sonnet-20241022")
+        self.assertGreater(balance._revision(minor), balance._revision(dated))
+        self.assertGreater(balance._revision(dated), balance._revision(older_dated))
+        self.assertGreater(balance._revision(older_dated), balance._revision(legacy))
+        self.assertEqual(balance._claude([legacy], "p", "sonnet")["id"], "claude-3-5-sonnet-20241022")
+        self.assertEqual(balance._claude([dated, minor, legacy], "p", "sonnet")["id"], "claude-sonnet-4-6")
+
+    def test_role_fallbacks_exclude_primary_and_conserve_avoids_included_first(self):
+        analysis = balance.analyze_quotas(_usage(included=0.95, other=0.10, gemini=0.10, claude=0.10))
+        profiles = balance.generate_profiles(analysis, CATALOG)
+        for name in ("grok-power", "claude-first", "balanced", "conserve-cursor"):
+            profile = profiles[name]
+            primary = {**profile["modelRoles"], **profile["task"]["agentModelOverrides"]}
+            for role, assigned in primary.items():
+                hops = profile["fallbackChains"].get(role, [])
+                self.assertNotIn(assigned, hops, f"{name}.{role} fell back onto itself")
+        conserve_slow = profiles["conserve-cursor"]["fallbackChains"]["slow"]
+        self.assertEqual(conserve_slow[0], "beta/claude-opus-4-6:high")
+
+    def test_selector_validates_efforts_and_avoids_duplicate_suffix(self):
+        m = _model("p", "model-x", efforts=["low", "high"])
+        self.assertEqual(balance.selector(m, "high"), "p/model-x:high")
+        self.assertEqual(balance.selector(m, "xhigh"), "p/model-x")
+        suffixed = _model("p", "model-x-high", efforts=["high"])
+        self.assertEqual(balance.selector(suffixed, "high"), "p/model-x-high")
+
+    def test_apply_profile_preserves_unmanaged_roles_and_is_atomic(self):
+        try:
+            import yaml
+        except ImportError:
+            self.skipTest("PyYAML not installed")
+        with tempfile.TemporaryDirectory() as tmp:
+            cfg = Path(tmp) / "config.yml"
+            cfg.write_text("modelRoles:\n  custom: keep/me\n  default: old/model\n")
+            os.chmod(cfg, 0o600)
+            analysis = balance.analyze_quotas(_usage())
+            profile = balance.generate_profiles(analysis, CATALOG)["grok-power"]
+            with mock.patch.dict(os.environ, {"PI_CODING_AGENT_DIR": tmp}):
+                ok = balance.apply_profile(profile, quiet=True)
+            self.assertTrue(ok)
+            written = yaml.safe_load(cfg.read_text())
+            self.assertEqual(written["modelRoles"]["custom"], "keep/me")
+            self.assertEqual(written["modelRoles"]["default"], "alpha/grok-4.7:medium")
+            self.assertEqual(stat.S_IMODE(cfg.stat().st_mode), 0o600)
+            leftovers = [p.name for p in Path(tmp).iterdir() if p.name.endswith(".tmp")]
+            self.assertEqual(leftovers, [])
+
+    def test_apply_profile_returns_false_when_missing_default(self):
+        try:
+            import yaml  # noqa: F401
+        except ImportError:
+            self.skipTest("PyYAML not installed")
+        with tempfile.TemporaryDirectory() as tmp:
+            cfg = Path(tmp) / "config.yml"
+            cfg.write_text("modelRoles:\n  default: keep/me\n")
+            bad_profile = {
+                "name": "broken",
+                "modelRoles": {"default": None},
+                "task": {"agentModelOverrides": {}},
+                "fallbackChains": {},
+            }
+            with mock.patch.dict(os.environ, {"PI_CODING_AGENT_DIR": tmp}):
+                ok = balance.apply_profile(bad_profile, quiet=True)
+            self.assertFalse(ok)
+            self.assertIn("keep/me", cfg.read_text())
+
+    def test_revision_handles_iso_dates_and_hyphenated_identity_revision(self):
+        iso_gpt = _model("p", "gpt-5-2025-08-07")
+        minor_gpt = _model("p", "gpt-5.2")
+        iso_41 = _model("p", "gpt-4.1-2025-04-14")
+        patch_41 = _model("p", "gpt-4.1.2")
+        self.assertGreater(balance._revision(minor_gpt), balance._revision(iso_gpt))
+        self.assertGreater(balance._revision(patch_41), balance._revision(iso_41))
+        hyphen_rev = balance._normalize_model({
+            "provider": "p",
+            "id": "custom",
+            "identity": {"revision": "4-6"},
+        })
+        self.assertEqual(balance._revision(hyphen_rev), (4, 6, 0, 0))
+
+    def test_load_catalog_accepts_json_list_stdin(self):
+        payload = json.dumps([{"provider": "p", "id": "m-1", "thinking": ["high"]}])
+        fake_stdin = io.StringIO(payload)
+        fake_stdin.isatty = lambda: False
+        with mock.patch.object(sys, "stdin", fake_stdin):
+            loaded = balance.load_catalog()
+        self.assertEqual(len(loaded), 1)
+        self.assertEqual(loaded[0]["id"], "m-1")
+
+    def test_effortless_grok_has_no_self_loop_in_fallback_chains(self):
+        usage = {
+            "reports": [
+                {
+                    "provider": "alpha",
+                    "limits": [_limit("alpha:inc", "Alpha Models", "monthly", 0.10)],
+                }
+            ]
+        }
+        catalog = [
+            balance._normalize_model({"provider": "alpha", "id": "grok-4.7", "thinking": []}),
+            balance._normalize_model({"provider": "alpha", "id": "grok-4.6", "thinking": []}),
+            balance._normalize_model({"provider": "alpha", "id": "composer-2.5-fast", "thinking": []}),
+        ]
+        analysis = balance.analyze_quotas(usage)
+        profiles = balance.generate_profiles(analysis, catalog)
+        for name in ("grok-power", "balanced", "conserve-cursor", "claude-first"):
+            for target, hops in profiles[name]["fallbackChains"].items():
+                self.assertNotIn(target, hops, f"{name} chain {target} loops onto itself")
+
+    def test_metered_flash_yields_to_general_flash_and_included_composer_fast(self):
+        usage = {
+            "reports": [
+                {
+                    "provider": "alpha",
+                    "limits": [
+                        _limit("alpha:inc", "Alpha Models", "monthly", 0.20),
+                        _limit("alpha:other", "Other Models", "monthly", 0.05, unit="usd", used=1, limit=20),
+                    ],
+                },
+                {
+                    "provider": "beta",
+                    "limits": [_limit("beta:gemini", "Gemini", "5h", 1.0)],
+                },
+                {
+                    "provider": "gamma",
+                    "limits": [_limit("gamma:req", "Requests", "monthly", 0.30)],
+                },
+            ]
+        }
+        catalog = [
+            _model("alpha", "gemini-3.8-flash"),
+            _model("alpha", "composer-2.5-fast"),
+            _model("beta", "gemini-3.8-flash"),
+            _model("gamma", "gemini-3.8-flash"),
+        ]
+        analysis = balance.analyze_quotas(usage)
+        flash = balance._pick_flash(catalog, analysis["providers"], balance.explicit_families(analysis))
+        self.assertEqual(flash["provider"]["id"], "gamma")
+
+        # Without gamma, alpha's gemini is metered so routine work prefers alpha's included composer-fast.
+        no_gamma_analysis = balance.analyze_quotas({"reports": usage["reports"][:2]})
+        no_gamma_profiles = balance.generate_profiles(no_gamma_analysis, catalog[:3])
+        self.assertEqual(no_gamma_profiles["balanced"]["modelRoles"]["default"], "alpha/composer-2.5-fast")
 
 
 if __name__ == "__main__":

@@ -43,6 +43,7 @@ type Ui = {
 
 const STATUS_KEY = "quota";
 const WIDGET_KEY = "quota-balancer";
+const BALANCER_TIMEOUT_MS = 30_000;
 
 function scriptPath(): string {
 	const here = dirname(realpathSync(fileURLToPath(import.meta.url)));
@@ -71,21 +72,71 @@ function catalogJson(ctx: { models?: { list?: () => CatalogModel[] } }): string 
 	return JSON.stringify({ models: slim });
 }
 
-function runBalancer(catalog: string): Promise<{ code: number; stdout: string; stderr: string }> {
+function runBalancer(
+	catalog: string,
+	apply: boolean,
+	timeoutMs: number = BALANCER_TIMEOUT_MS,
+): Promise<{ code: number; stdout: string; stderr: string }> {
 	const { promise, resolve } = Promise.withResolvers<{ code: number; stdout: string; stderr: string }>();
-	const child = spawn("python3", [scriptPath(), "--apply", "--json"], {
+	const args = apply ? [scriptPath(), "--apply", "--json"] : [scriptPath(), "--json"];
+	const child = spawn("python3", args, {
 		stdio: ["pipe", "pipe", "pipe"],
 	});
 	let stdout = "";
 	let stderr = "";
+	let settled = false;
+	let killTimer: ReturnType<typeof setTimeout> | undefined;
+
+	function clearKillTimer(): void {
+		if (killTimer) {
+			clearTimeout(killTimer);
+			killTimer = undefined;
+		}
+	}
+
+	function finish(code: number): void {
+		if (settled) return;
+		settled = true;
+		clearTimeout(timer);
+		resolve({ code, stdout, stderr });
+	}
+
+	const timer = setTimeout(() => {
+		stderr = `${stderr}${stderr ? "\n" : ""}quota-balancer timed out after ${Math.round(timeoutMs / 1000)}s`;
+		try {
+			child.kill("SIGTERM");
+		} catch {
+			// Ignore if already exited.
+		}
+		killTimer = setTimeout(() => {
+			try {
+				child.kill("SIGKILL");
+			} catch {
+				// Ignore if already exited.
+			}
+		}, 2_000);
+		killTimer.unref?.();
+		finish(124);
+	}, timeoutMs);
+
 	child.stdout.on("data", (chunk: Buffer) => {
 		stdout += chunk.toString();
 	});
 	child.stderr.on("data", (chunk: Buffer) => {
 		stderr += chunk.toString();
 	});
-	child.on("error", () => resolve({ code: 1, stdout, stderr }));
-	child.on("close", (code) => resolve({ code: code ?? 1, stdout, stderr }));
+	child.stdin.on("error", () => {
+		// Child may fail to spawn or close stdin early (EPIPE).
+	});
+	child.on("error", (err) => {
+		clearKillTimer();
+		stderr = `${stderr}${stderr ? "\n" : ""}${String(err)}`;
+		finish(1);
+	});
+	child.on("close", (code) => {
+		clearKillTimer();
+		finish(code ?? 1);
+	});
 	try {
 		child.stdin.end(catalog);
 	} catch {
@@ -174,12 +225,15 @@ function paint(
 		ui.setWidget?.(WIDGET_KEY, undefined);
 		return;
 	}
-	const lines = snapshot.panel.length > 0 ? snapshot.panel : [
+	const lines = snapshot.panel.length > 0 ? [...snapshot.panel] : [
 		`⚖ quota-balancer  [${snapshot.selected}]`,
 		snapshot.description,
 		`default ${snapshot.roles.default || "—"}`,
 		snapshot.claudeSource ? `Claude: ${snapshot.claudeSource}` : "",
 	].filter((line) => line.length > 0);
+	if (error) {
+		lines.push(`error: ${error}`);
+	}
 	ui.setWidget?.(WIDGET_KEY, lines, { placement: "aboveEditor" });
 }
 
@@ -189,8 +243,16 @@ export default function (pi: ExtensionAPI) {
 	let showPanel = false;
 	let running = false;
 
-	async function refresh(ctx: { ui?: Ui; models?: { list?: () => CatalogModel[] } }, announce: boolean): Promise<void> {
-		if (running) return;
+	async function refresh(
+		ctx: { ui?: Ui; models?: { list?: () => CatalogModel[] } },
+		options: { apply: boolean; announce: boolean },
+	): Promise<void> {
+		if (running) {
+			if (options.announce) {
+				ctx.ui?.notify?.("Quota refresh already in progress.", "info");
+			}
+			return;
+		}
 		running = true;
 		const ui = ctx.ui;
 		ui?.setStatus?.(
@@ -198,26 +260,36 @@ export default function (pi: ExtensionAPI) {
 			`${colorize(ui, "dim", "○")} ⚖ ${colorize(ui, "muted", "quota: ")}${colorize(ui, "text", "…")}`,
 		);
 		try {
-			const { code, stdout, stderr } = await runBalancer(catalogJson(ctx));
-			const next = code === 0 ? readSnapshot(stdout) : undefined;
-			if (!next) {
+			const { code, stdout, stderr } = await runBalancer(catalogJson(ctx), options.apply);
+			const next = readSnapshot(stdout);
+			const applyFailed = options.apply && (code !== 0 || !next?.applied);
+			if (!next || (code !== 0 && !options.apply)) {
 				snapshot = undefined;
 				lastError = (stderr || stdout || "quota balancer returned no quotas").trim().split("\n").at(-1);
 				paint(ctx, undefined, lastError, showPanel);
-				if (announce) ui?.notify?.(lastError || "Failed to run the quota balancer.", "error");
+				if (options.announce) ui?.notify?.(lastError || "Failed to run the quota balancer.", "error");
 				return;
 			}
 			snapshot = next;
+			if (applyFailed) {
+				lastError = (stderr || "Failed to write OMP config.").trim().split("\n").at(-1);
+				paint(ctx, snapshot, lastError, showPanel);
+				if (options.announce) ui?.notify?.(lastError || "Failed to write OMP config.", "error");
+				return;
+			}
 			lastError = undefined;
 			paint(ctx, snapshot, undefined, showPanel);
-			if (announce) {
-				ui?.notify?.(`Quota ${snapshot.selected} · ${snapshot.summary}`, levelNotify(snapshot));
+			if (options.announce) {
+				const note = options.apply
+					? `Rebalanced ${snapshot.selected} · ${snapshot.summary} (start a new session to reload)`
+					: `Quota ${snapshot.selected} · ${snapshot.summary}`;
+				ui?.notify?.(note, levelNotify(snapshot));
 			}
 		} catch (err) {
 			snapshot = undefined;
 			lastError = String(err);
 			paint(ctx, undefined, lastError, showPanel);
-			if (announce) ui?.notify?.(lastError, "error");
+			if (options.announce) ui?.notify?.(lastError, "error");
 		} finally {
 			running = false;
 		}
@@ -232,7 +304,7 @@ export default function (pi: ExtensionAPI) {
 	// The first frame wipes notify(). The footer badge is set before that paint
 	// and replaced when the quota read finishes, same channel caveman/ponytail use.
 	pi.on("session_start", (_event, ctx) => {
-		void refresh(ctx, false);
+		void refresh(ctx, { apply: false, announce: false });
 	});
 
 	pi.on("session_switch", (_event, ctx) => {
@@ -247,14 +319,14 @@ export default function (pi: ExtensionAPI) {
 	pi.registerCommand("rebalance", {
 		description: "Re-read provider quotas and rewrite the OMP model assignment",
 		handler: async (_args, ctx) => {
-			await refresh(ctx, true);
+			await refresh(ctx, { apply: true, announce: true });
 		},
 	});
 
 	pi.registerCommand("quota", {
 		description: "Show, hide, or refresh the quota-balancer panel",
 		handler: async (args, ctx) => {
-			const command = args.trim().toLowerCase();
+			const command = (args ?? "").trim().toLowerCase();
 			if (command === "hide" || command === "off" || (command === "" && showPanel)) {
 				showPanel = false;
 				paint(ctx, snapshot, lastError, showPanel);
@@ -275,7 +347,7 @@ export default function (pi: ExtensionAPI) {
 				return;
 			}
 			if (command === "refresh") {
-				await refresh(ctx, true);
+				await refresh(ctx, { apply: false, announce: true });
 				return;
 			}
 			ctx.ui?.notify?.("Usage: /quota [on|off|status|refresh]", "warning");

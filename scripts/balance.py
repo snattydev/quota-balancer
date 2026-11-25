@@ -11,12 +11,17 @@ rest. Roles then follow whichever provider still has room for that family.
 import json
 import os
 import re
+import shutil
 import subprocess
 import sys
+import tempfile
 from datetime import datetime, timezone
 from pathlib import Path
 
 _TOKEN = re.compile(r"[^a-z0-9]+")
+_CTX_TOKEN = re.compile(r"(?:^|[-_])\d+[km](?=$|[-_])")
+_ISO_DATE_TOKEN = re.compile(r"(?:^|[-_])((?:19|20)\d{2})[-_](\d{2})[-_](\d{2})(?=$|[-_])")
+_STAMP_TOKEN = re.compile(r"(?:^|[-_])((?:19|20)\d{6}|\d{3,4})(?=$|[-_])")
 _FAMILY = {
     "gemini": "gemini",
     "claude": "claude",
@@ -27,7 +32,10 @@ _FAMILY = {
     "composer": "composer",
     "opus": "opus",
     "sonnet": "sonnet",
+    "haiku": "haiku",
 }
+_METERED_FAMILIES = frozenset({"claude", "opus", "sonnet", "haiku", "gemini", "gpt"})
+_FAST_HINTS = ("mini", "flash", "haiku", "fast", "nano", "lite")
 _WINDOW_MS = {"5h": 18_000_000, "weekly": 604_800_000, "monthly": 2_592_000_000}
 _PERCENT_FULL = 0.90
 _USD_FULL = 0.95
@@ -65,7 +73,7 @@ def load_catalog():
         raw = sys.stdin.read()
         if raw.strip():
             data = json.loads(raw)
-            models = data.get("models", data if isinstance(data, list) else [])
+            models = data.get("models", []) if isinstance(data, dict) else (data if isinstance(data, list) else [])
             if models:
                 return [_normalize_model(m) for m in models if m.get("provider") and m.get("id")]
     res = subprocess.run(
@@ -100,11 +108,24 @@ def _parts(text):
 def _revision(model):
     rev = (model.get("identity") or {}).get("revision")
     if rev:
-        parts = []
-        for piece in str(rev).split("."):
-            parts.append(int(piece) if piece.isdigit() else 0)
-        return tuple(parts)
-    return tuple(int(n) for n in re.findall(r"\d+", model["id"])[:3])
+        parts = [int(piece) for piece in re.split(r"[.\-_]+", str(rev)) if piece.isdigit()]
+        while len(parts) < 3:
+            parts.append(0)
+        return tuple(parts[:3]) + (0,)
+    mid = model["id"].lower()
+    stamps = [
+        int(f"{match.group(1)}{match.group(2)}{match.group(3)}")
+        for match in _ISO_DATE_TOKEN.finditer(mid)
+    ]
+    cleaned = _ISO_DATE_TOKEN.sub("", mid)
+    cleaned = _CTX_TOKEN.sub("", cleaned)
+    stamps.extend(int(match.group(1)) for match in _STAMP_TOKEN.finditer(cleaned))
+    stamp = max(stamps) if stamps else 0
+    cleaned = _STAMP_TOKEN.sub("", cleaned)
+    nums = [int(n) for n in re.findall(r"\d+", cleaned)[:3]]
+    while len(nums) < 3:
+        nums.append(0)
+    return tuple(nums) + (stamp,)
 
 
 def _logical_rank(model):
@@ -129,8 +150,10 @@ def model_families(model):
         found.update(("claude", "opus"))
     if "sonnet" in mid:
         found.update(("claude", "sonnet"))
+    if "haiku" in mid:
+        found.update(("claude", "haiku"))
     for token, canonical in _FAMILY.items():
-        if token in ("opus", "sonnet", "claude", "anthropic"):
+        if token in ("opus", "sonnet", "haiku", "claude", "anthropic"):
             continue
         if token in mid:
             found.add(canonical)
@@ -187,7 +210,7 @@ def _claude(catalog, provider, family):
     for model in _provider_models(catalog, provider):
         ident = model.get("identity") or {}
         mid = model["id"]
-        if ident.get("family") != family and f"claude-{family}" not in mid:
+        if ident.get("family") != family and family not in _parts(mid):
             continue
         if mid.endswith("-fast") or "-1m" in mid:
             continue
@@ -204,7 +227,7 @@ def _older_claude(catalog, provider, family, newest):
         mid = model["id"]
         if model["id"] == newest["id"]:
             continue
-        if ident.get("family") != family and f"claude-{family}" not in mid:
+        if ident.get("family") != family and family not in _parts(mid):
             continue
         if mid.endswith("-fast") or "-1m" in mid:
             continue
@@ -355,6 +378,20 @@ def explicit_families(analysis):
     return found
 
 
+def _provider_own_families(provider):
+    tokens = _parts(provider.get("id"))
+    for pool in provider.get("pools") or []:
+        if pool["kind"] == "included":
+            tokens |= _parts(pool.get("label"))
+    own = set()
+    for token, canonical in _FAMILY.items():
+        if token in tokens:
+            own.add(canonical)
+    if "claude" in own:
+        own.update(("opus", "sonnet", "haiku"))
+    return own
+
+
 def covering_pools(provider, model, explicit):
     """Pools on this provider that meter this model."""
     families = model_families(model)
@@ -364,14 +401,14 @@ def covering_pools(provider, model, explicit):
     ]
     if named:
         return named
-    if families & explicit:
+    metered_families = (explicit | _METERED_FAMILIES) - _provider_own_families(provider)
+    if families & metered_families:
         metered = [pool for pool in provider["pools"] if pool["kind"] == "metered"]
         if metered:
             return metered
-    else:
-        included = [pool for pool in provider["pools"] if pool["kind"] == "included"]
-        if included:
-            return included
+    included = [pool for pool in provider["pools"] if pool["kind"] == "included"]
+    if included:
+        return included
     general = [pool for pool in provider["pools"] if pool["kind"] == "general"]
     if general:
         return general
@@ -408,12 +445,20 @@ def _pick_grok(catalog, providers, explicit):
         best = groks[0]
         previous = next((item for item in groks[1:] if _revision(item) < _revision(best)), None)
         pools = covering_pools(provider, best, explicit)
-        found.append((pool_pressure(pools), _revision(best), best, previous, provider, pools))
+        avail = pool_available(pools)
+        found.append((0 if avail else 1, pool_pressure(pools), _revision(best), best, previous, provider, pools, avail))
     if not found:
         return None
-    found.sort(key=lambda item: (item[0], tuple(-part for part in item[1])))
-    _pressure, _rev, best, previous, provider, pools = found[0]
-    return {"model": best, "previous": previous, "provider": provider, "pools": pools, "pressure": _pressure}
+    found.sort(key=lambda item: (item[0], item[1], tuple(-part for part in item[2])))
+    _unavail, _pressure, _rev, best, previous, provider, pools, avail = found[0]
+    return {
+        "model": best,
+        "previous": previous,
+        "provider": provider,
+        "pools": pools,
+        "pressure": _pressure,
+        "available": avail,
+    }
 
 
 def _pick_composer(catalog, providers, explicit, fast):
@@ -423,12 +468,21 @@ def _pick_composer(catalog, providers, explicit, fast):
         if not model:
             continue
         pools = covering_pools(provider, model, explicit)
-        found.append((pool_pressure(pools), _revision(model), model, provider, pools))
+        avail = pool_available(pools)
+        found.append((0 if avail else 1, pool_pressure(pools), _revision(model), model, provider, pools, avail))
     if not found:
         return None
-    found.sort(key=lambda item: (item[0], tuple(-part for part in item[1])))
-    _pressure, _rev, model, provider, pools = found[0]
-    return {"model": model, "provider": provider, "pools": pools}
+    found.sort(key=lambda item: (item[0], item[1], tuple(-part for part in item[2])))
+    _unavail, _pressure, _rev, model, provider, pools, avail = found[0]
+    return {"model": model, "provider": provider, "pools": pools, "available": avail}
+
+
+def _flash_tier(pools):
+    if any(pool["kind"] == "named" for pool in pools):
+        return 0
+    if any(pool["kind"] in ("included", "general") for pool in pools):
+        return 1
+    return 2
 
 
 def _pick_flash(catalog, providers, explicit):
@@ -438,13 +492,55 @@ def _pick_flash(catalog, providers, explicit):
         if not model:
             continue
         pools = covering_pools(provider, model, explicit)
-        named = 0 if any(pool["kind"] == "named" for pool in pools) else 1
-        found.append((named, pool_pressure(pools), _revision(model), model, provider, pools))
+        avail = pool_available(pools)
+        tier = _flash_tier(pools)
+        found.append((0 if avail else 1, tier, pool_pressure(pools), _revision(model), model, provider, pools, avail))
+    if not found:
+        return None
+    found.sort(key=lambda item: (item[0], item[1], item[2], tuple(-part for part in item[3])))
+    _unavail, tier, _pressure, _rev, model, provider, pools, avail = found[0]
+    return {"model": model, "provider": provider, "pools": pools, "available": avail, "metered": tier == 2}
+
+
+def _pick_haiku(catalog, providers, explicit):
+    found = []
+    for provider in providers:
+        model = _claude(catalog, provider["id"], "haiku")
+        if not model:
+            continue
+        pools = covering_pools(provider, model, explicit)
+        avail = pool_available(pools)
+        found.append((0 if avail else 1, pool_pressure(pools), _revision(model), model, provider, pools, avail))
     if not found:
         return None
     found.sort(key=lambda item: (item[0], item[1], tuple(-part for part in item[2])))
-    _named, _pressure, _rev, model, provider, pools = found[0]
-    return {"model": model, "provider": provider, "pools": pools}
+    _unavail, _pressure, _rev, model, provider, pools, avail = found[0]
+    return {"model": model, "provider": provider, "pools": pools, "available": avail}
+
+
+def _pick_generic(catalog, providers, explicit, fast):
+    found = []
+    for provider in providers:
+        candidates = []
+        for model in _provider_models(catalog, provider["id"]):
+            mid = model["id"].lower()
+            if "image" in mid or "500k" in mid or "-1m" in mid:
+                continue
+            is_fast = any(hint in _parts(mid) for hint in _FAST_HINTS)
+            if is_fast != fast:
+                continue
+            candidates.append(model)
+        model = _best(candidates)
+        if not model:
+            continue
+        pools = covering_pools(provider, model, explicit)
+        avail = pool_available(pools)
+        found.append((0 if avail else 1, pool_pressure(pools), _revision(model), model, provider, pools, avail))
+    if not found:
+        return None
+    found.sort(key=lambda item: (item[0], item[1], tuple(-part for part in item[2])))
+    _unavail, _pressure, _rev, model, provider, pools, avail = found[0]
+    return {"model": model, "provider": provider, "pools": pools, "available": avail}
 
 
 def _claude_candidates(catalog, providers, explicit):
@@ -565,6 +661,17 @@ def panel_lines(analysis, selected_name, profile, applied):
     return lines
 
 
+def _dedup_role_chains(chains, roles, overrides):
+    primary = {**roles, **overrides}
+    out = {}
+    for target, hops in chains.items():
+        assigned = primary.get(target)
+        filtered = [hop for hop in hops if hop and hop != assigned and hop != target]
+        if filtered:
+            out[target] = filtered
+    return out
+
+
 def generate_profiles(analysis, catalog):
     providers = list(analysis.get("providers") or [])
     known = _by_provider(analysis)
@@ -576,7 +683,10 @@ def generate_profiles(analysis, catalog):
     composer = _pick_composer(catalog, providers, explicit, fast=False)
     composer_fast = _pick_composer(catalog, providers, explicit, fast=True)
     flash = _pick_flash(catalog, providers, explicit)
+    haiku = _pick_haiku(catalog, providers, explicit)
     claude = _pick_claude(catalog, providers, explicit)
+    generic_fast = _pick_generic(catalog, providers, explicit, fast=True)
+    generic_best = _pick_generic(catalog, providers, explicit, fast=False)
     # A frontier 429 should spend a different provider's Claude pool before the
     # same provider's metered bucket.
     fallback_claude = claude
@@ -599,6 +709,10 @@ def generate_profiles(analysis, catalog):
     gem = flash["model"] if flash else None
     gem_sel = selector(gem)
     gem_high = selector(gem, "high")
+    haiku_sel = selector(haiku["model"]) if haiku else None
+    generic_fast_sel = selector(generic_fast["model"]) if generic_fast else None
+    generic_med_sel = selector(generic_best["model"], "medium") if generic_best else None
+    generic_high_sel = selector(generic_best["model"], "high") if generic_best else None
 
     claude_ok = bool(claude and claude["available"])
     if claude_ok:
@@ -612,22 +726,22 @@ def generate_profiles(analysis, catalog):
         sonnet_prev_high = selector(claude["sonnet_prev"], "high")
         sonnet_prev_bare = selector(claude["sonnet_prev"])
         if claude["named"]:
-            plan_model = opus_high or sonnet_high or grok_high
-            slow_model = opus_high or grok_high
+            plan_model = opus_high or sonnet_high or grok_high or generic_high_sel
+            slow_model = opus_high or grok_high or generic_high_sel
         else:
-            plan_model = sonnet_high or opus_high or grok_high
-            slow_model = opus_high or grok_high
+            plan_model = sonnet_high or opus_high or grok_high or generic_high_sel
+            slow_model = opus_high or grok_high or generic_high_sel
         review_model = sonnet_high or plan_model
-        security_model = opus_high or grok_xhigh
+        security_model = opus_high or grok_xhigh or generic_high_sel
         claude_source = (
             f"{claude['provider']['id']} ({selector(sonnet) or '-'} / {selector(opus) or '-'})"
         )
     else:
         opus_high = sonnet_high = opus_bare = sonnet_bare = None
         opus_prev_bare = sonnet_prev_high = sonnet_prev_bare = None
-        plan_model = slow_model = grok_high
-        review_model = grok_high
-        security_model = grok_xhigh
+        plan_model = slow_model = grok_high or generic_high_sel
+        review_model = grok_high or generic_high_sel
+        security_model = grok_xhigh or generic_high_sel
         claude_source = "Exhausted (falling back to the frontier model loaded in the catalog)"
 
     fb = fallback_claude if fallback_claude and fallback_claude["available"] else None
@@ -636,156 +750,197 @@ def generate_profiles(analysis, catalog):
     fb_opus_bare = selector(fb["opus"]) if fb else None
     fb_sonnet_bare = selector(fb["sonnet"]) if fb else None
 
-    fast_routine = gem_sel or composer_fast_sel or grok_med
-    frontier = grok_high or slow_model or plan_model or fast_routine
+    flash_routine_sel = None if (flash and flash["metered"] and composer_fast and composer_fast["available"]) else gem_sel
+    fast_routine = (
+        flash_routine_sel
+        or composer_fast_sel
+        or gem_sel
+        or haiku_sel
+        or grok_med
+        or generic_fast_sel
+        or generic_med_sel
+    )
+    frontier = grok_high or slow_model or plan_model or generic_high_sel or fast_routine
+    fallback_generic_fast = None if (grok_med or gem_sel or composer_fast_sel) else generic_fast_sel
+    fallback_generic_high = None if (grok_high or slow_model or plan_model) else generic_high_sel
 
-    fallback_chains = {
-        "default": chain(grok_med, grok_prev_base, gem_sel),
-        "slow": chain(grok_high, grok_prev_high, composer_sel, gem_sel),
-        "smol": chain(composer_fast_sel, gem_sel),
-        "plan": chain(grok_high, grok_prev_high, composer_sel, gem_sel),
-        grok_med: chain(grok_prev_base, composer_fast_sel, gem_sel),
-        grok_high: chain(grok_prev_high, composer_sel, gem_sel),
-        grok_xhigh: chain(grok_prev_xhigh, grok_high, gem_sel),
-        grok_prev_base: chain(composer_sel, gem_sel),
-        grok_prev_high: chain(composer_sel, gem_sel),
-        grok_prev_xhigh: chain(grok_high, gem_sel),
-        opus_high: chain(grok_xhigh, grok_high, gem_sel),
-        opus_bare: chain(grok_xhigh, grok_high, gem_sel),
-        sonnet_high: chain(grok_high, gem_sel),
-        sonnet_bare: chain(grok_high, gem_sel),
-        sonnet_prev_high: chain(grok_high, gem_sel),
-        sonnet_prev_bare: chain(grok_high, gem_sel),
-        opus_prev_bare: chain(grok_xhigh, gem_sel),
-        fb_opus_high: chain(grok_xhigh, grok_high, gem_sel),
-        fb_opus_bare: chain(grok_xhigh, grok_high, gem_sel),
-        fb_sonnet_high: chain(grok_high, gem_sel),
-        fb_sonnet_bare: chain(grok_high, gem_sel),
-        "reviewer": chain(grok_high, gem_sel),
-        "security-reviewer": chain(grok_xhigh, gem_sel),
-        # A named-pool model must not fall through to the same id on a metered
-        # pool (that spends a different provider's paid bucket).
-        gem_sel: chain(grok_med, composer_fast_sel),
-        gem_high: chain(grok_high, composer_sel),
-    }
+    fallback_chains = {}
+
+    def add_chain(target, *hops):
+        if not target:
+            return
+        items = [hop for hop in chain(*hops) if hop != target]
+        if not items:
+            return
+        if target not in fallback_chains:
+            fallback_chains[target] = items
+        else:
+            fallback_chains[target] = chain(*fallback_chains[target], *items)
+
+    add_chain("default", grok_med, grok_prev_base, gem_sel, fallback_generic_fast)
+    add_chain("slow", grok_high, grok_prev_high, composer_sel, gem_sel, fallback_generic_high)
+    add_chain("smol", composer_fast_sel, haiku_sel, gem_sel, fallback_generic_fast)
+    add_chain("plan", grok_high, grok_prev_high, composer_sel, gem_sel, fallback_generic_high)
+    add_chain(grok_med, grok_prev_base, composer_fast_sel, gem_sel)
+    add_chain(grok_high, grok_prev_high, composer_sel, gem_sel)
+    add_chain(grok_xhigh, grok_prev_xhigh, grok_high, gem_sel)
+    add_chain(grok_prev_base, composer_sel, gem_sel)
+    add_chain(grok_prev_high, composer_sel, gem_sel)
+    add_chain(grok_prev_xhigh, grok_high, gem_sel)
+    add_chain(opus_high, grok_xhigh, grok_high, gem_sel, fallback_generic_high)
+    add_chain(opus_bare, grok_xhigh, grok_high, gem_sel, fallback_generic_high)
+    add_chain(sonnet_high, grok_high, gem_sel, fallback_generic_high)
+    add_chain(sonnet_bare, grok_high, gem_sel, fallback_generic_high)
+    add_chain(sonnet_prev_high, grok_high, gem_sel, fallback_generic_high)
+    add_chain(sonnet_prev_bare, grok_high, gem_sel, fallback_generic_high)
+    add_chain(opus_prev_bare, grok_xhigh, gem_sel, fallback_generic_high)
+    add_chain(fb_opus_high, grok_xhigh, grok_high, gem_sel, fallback_generic_high)
+    add_chain(fb_opus_bare, grok_xhigh, grok_high, gem_sel, fallback_generic_high)
+    add_chain(fb_sonnet_high, grok_high, gem_sel, fallback_generic_high)
+    add_chain(fb_sonnet_bare, grok_high, gem_sel, fallback_generic_high)
+    add_chain("reviewer", grok_high, gem_sel, fallback_generic_high)
+    add_chain("security-reviewer", grok_xhigh, gem_sel, fallback_generic_high)
+    # A named-pool model must not fall through to the same id on a metered
+    # pool (that spends a different provider's paid bucket).
+    add_chain(gem_sel, grok_med, composer_fast_sel)
+    add_chain(gem_high, grok_high, composer_sel)
     for provider in providers:
         if any(pool["kind"] == "named" for pool in provider["pools"]):
-            fallback_chains[f"{provider['id']}/*"] = chain(grok_med, composer_fast_sel)
+            prefix = f"{provider['id']}/"
+            hops = [
+                hop for hop in chain(grok_med, composer_fast_sel, fallback_generic_fast)
+                if not hop.startswith(prefix)
+            ]
+            if hops:
+                fallback_chains[f"{provider['id']}/*"] = hops
     fallback_chains = {key: value for key, value in fallback_chains.items() if key and value}
 
     grok_fallbacks = {
         **fallback_chains,
-        "slow": chain(fb_opus_high, grok_prev_high, composer_sel, gem_sel),
-        "plan": chain(fb_opus_high, grok_prev_high, composer_sel, gem_sel),
-        "reviewer": chain(fb_sonnet_high, gem_sel),
-        "security-reviewer": chain(fb_opus_high, gem_sel),
+        "slow": chain(fb_opus_high, grok_prev_high, composer_sel, gem_sel, fallback_generic_high),
+        "plan": chain(fb_opus_high, grok_prev_high, composer_sel, gem_sel, fallback_generic_high),
+        "reviewer": chain(fb_sonnet_high, gem_sel, fallback_generic_high),
+        "security-reviewer": chain(fb_opus_high, gem_sel, fallback_generic_high),
     }
 
-    frontier_name = grok_model["id"] if grok_model else "the included frontier model"
-    fast_name = gem["id"] if gem else "the named fast model"
+    conserve_fallbacks = {
+        **fallback_chains,
+        "default": chain(composer_fast_sel, haiku_sel, fb_sonnet_high if claude_ok else None, grok_med, fallback_generic_fast),
+        "slow": chain(fb_opus_high if claude_ok else None, fb_sonnet_high if claude_ok else None, composer_sel, gem_high, grok_high, fallback_generic_high),
+        "plan": chain(fb_opus_high if claude_ok else None, fb_sonnet_high if claude_ok else None, composer_sel, gem_high, grok_high, fallback_generic_high),
+        "reviewer": chain(fb_sonnet_high if claude_ok else None, gem_high, grok_high, fallback_generic_high),
+        "security-reviewer": chain(fb_opus_high if claude_ok else None, gem_high, grok_xhigh, fallback_generic_high),
+    }
 
+    frontier_name = grok_model["id"] if grok_model else (
+        generic_best["model"]["id"] if generic_best else "the included frontier model"
+    )
+    fast_name = gem["id"] if gem else (
+        generic_fast["model"]["id"] if generic_fast else "the named fast model"
+    )
+
+    grok_roles = {
+        "default": grok_med or fast_routine,
+        "smol": composer_fast_sel or fast_routine,
+        "slow": grok_high or frontier,
+        "plan": grok_high or frontier,
+        "advisor": composer_fast_sel or fast_routine,
+        "commit": composer_fast_sel or fast_routine,
+        "grok": grok_med or fast_routine,
+    }
+    grok_overrides = {
+        "scout": composer_fast_sel or fast_routine,
+        "sonic": composer_fast_sel or fast_routine,
+        "reviewer": grok_high or frontier,
+        "security-reviewer": grok_xhigh or frontier,
+        "task": grok_med or fast_routine,
+    }
     grok_profile = {
         "name": "grok-power",
         "description": f"Prefer {frontier_name} on the included pool. Named fast models stay in the fallback chain.",
         "claude_source": claude_source,
         "claude_active": claude_ok,
-        "modelRoles": {
-            "default": grok_med or fast_routine,
-            "smol": composer_fast_sel or fast_routine,
-            "slow": grok_high or frontier,
-            "plan": grok_high or frontier,
-            "advisor": composer_fast_sel or fast_routine,
-            "commit": composer_fast_sel or fast_routine,
-            "grok": grok_med or fast_routine,
-        },
-        "task": {
-            "agentModelOverrides": {
-                "scout": composer_fast_sel or fast_routine,
-                "sonic": composer_fast_sel or fast_routine,
-                "reviewer": grok_high or frontier,
-                "security-reviewer": grok_xhigh or frontier,
-                "task": grok_med or fast_routine,
-            }
-        },
-        "fallbackChains": grok_fallbacks,
+        "modelRoles": grok_roles,
+        "task": {"agentModelOverrides": grok_overrides},
+        "fallbackChains": _dedup_role_chains(grok_fallbacks, grok_roles, grok_overrides),
     }
 
+    balanced_roles = {
+        "default": fast_routine,
+        "smol": fast_routine,
+        "slow": grok_high or frontier,
+        "plan": plan_model or frontier,
+        "advisor": fast_routine,
+        "commit": fast_routine,
+        "grok": grok_med or fast_routine,
+    }
+    balanced_overrides = {
+        "scout": fast_routine,
+        "sonic": composer_fast_sel or fast_routine,
+        "reviewer": review_model or frontier,
+        "security-reviewer": security_model or frontier,
+        "task": fast_routine,
+    }
     balanced_profile = {
         "name": "balanced",
         "description": f"Routine work on {fast_name}, frontier work on the included pool, Claude when a Claude pool is open ({claude_source}).",
         "claude_source": claude_source,
         "claude_active": claude_ok,
-        "modelRoles": {
-            "default": fast_routine,
-            "smol": fast_routine,
-            "slow": grok_high or frontier,
-            "plan": plan_model or frontier,
-            "advisor": fast_routine,
-            "commit": fast_routine,
-            "grok": grok_med or fast_routine,
-        },
-        "task": {
-            "agentModelOverrides": {
-                "scout": fast_routine,
-                "sonic": composer_fast_sel or fast_routine,
-                "reviewer": review_model or frontier,
-                "security-reviewer": security_model or frontier,
-                "task": fast_routine,
-            }
-        },
-        "fallbackChains": fallback_chains,
+        "modelRoles": balanced_roles,
+        "task": {"agentModelOverrides": balanced_overrides},
+        "fallbackChains": _dedup_role_chains(fallback_chains, balanced_roles, balanced_overrides),
     }
 
+    conserve_roles = {
+        "default": fast_routine,
+        "smol": fast_routine,
+        "slow": fast_routine,
+        "plan": fast_routine,
+        "advisor": fast_routine,
+        "commit": fast_routine,
+        "grok": grok_med or fast_routine,
+    }
+    conserve_overrides = {
+        "scout": fast_routine,
+        "sonic": fast_routine,
+        "reviewer": (review_model or fast_routine) if claude_ok else fast_routine,
+        "security-reviewer": (security_model or fast_routine) if claude_ok else fast_routine,
+        "task": fast_routine,
+    }
     conserve_profile = {
         "name": "conserve-cursor",
         "description": f"Reserve the included pool. Routine roles use {fast_name}.",
         "claude_source": claude_source,
         "claude_active": claude_ok,
-        "modelRoles": {
-            "default": fast_routine,
-            "smol": fast_routine,
-            "slow": fast_routine,
-            "plan": fast_routine,
-            "advisor": fast_routine,
-            "commit": fast_routine,
-            "grok": grok_med or fast_routine,
-        },
-        "task": {
-            "agentModelOverrides": {
-                "scout": fast_routine,
-                "sonic": fast_routine,
-                "reviewer": (review_model or fast_routine) if claude_ok else fast_routine,
-                "security-reviewer": (security_model or fast_routine) if claude_ok else fast_routine,
-                "task": fast_routine,
-            }
-        },
-        "fallbackChains": fallback_chains,
+        "modelRoles": conserve_roles,
+        "task": {"agentModelOverrides": conserve_overrides},
+        "fallbackChains": _dedup_role_chains(conserve_fallbacks, conserve_roles, conserve_overrides),
     }
 
+    claude_roles = {
+        "default": fast_routine,
+        "smol": fast_routine,
+        "slow": slow_model or frontier,
+        "plan": plan_model or frontier,
+        "advisor": fast_routine,
+        "commit": fast_routine,
+        "grok": grok_med or fast_routine,
+    }
+    claude_overrides = {
+        "scout": fast_routine,
+        "sonic": composer_fast_sel or fast_routine,
+        "reviewer": review_model or frontier,
+        "security-reviewer": security_model or frontier,
+        "task": fast_routine,
+    }
     claude_first_profile = {
         "name": "claude-first",
         "description": f"Prefer Claude ({claude_source}) for slow, plan, and reviews; other roles use the named fast pool.",
         "claude_source": claude_source,
         "claude_active": claude_ok,
-        "modelRoles": {
-            "default": fast_routine,
-            "smol": fast_routine,
-            "slow": slow_model or frontier,
-            "plan": plan_model or frontier,
-            "advisor": fast_routine,
-            "commit": fast_routine,
-            "grok": grok_med or fast_routine,
-        },
-        "task": {
-            "agentModelOverrides": {
-                "scout": fast_routine,
-                "sonic": composer_fast_sel or fast_routine,
-                "reviewer": review_model or frontier,
-                "security-reviewer": security_model or frontier,
-                "task": fast_routine,
-            }
-        },
-        "fallbackChains": fallback_chains,
+        "modelRoles": claude_roles,
+        "task": {"agentModelOverrides": claude_overrides},
+        "fallbackChains": _dedup_role_chains(fallback_chains, claude_roles, claude_overrides),
     }
 
     frontier_pressure = grok["pressure"] if grok else pool_pressure([
@@ -794,7 +949,7 @@ def generate_profiles(analysis, catalog):
         for pool in provider["pools"]
         if pool["kind"] in ("included", "general")
     ])
-    if grok and frontier_pressure < 0.80:
+    if grok and grok["available"] and frontier_pressure < 0.80:
         recommended = "grok-power"
     elif claude_ok:
         recommended = "claude-first"
@@ -881,8 +1036,28 @@ def apply_profile(profile_data, quiet=False):
         config["retry"] = {}
     config["retry"]["fallbackChains"] = profile_data["fallbackChains"]
 
-    with open(path, "w") as handle:
-        yaml.dump(config, handle, sort_keys=False)
+    tmp_path = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            mode="w",
+            dir=path.parent,
+            prefix=f".{path.name}.",
+            suffix=".tmp",
+            delete=False,
+        ) as handle:
+            tmp_path = Path(handle.name)
+            yaml.dump(config, handle, sort_keys=False)
+            handle.flush()
+            os.fsync(handle.fileno())
+        shutil.copymode(path, tmp_path)
+        os.replace(tmp_path, path)
+    except Exception:
+        if tmp_path is not None:
+            try:
+                tmp_path.unlink()
+            except OSError:
+                pass
+        raise
 
     say(f"\n[OK] Wrote profile [{profile_data['name']}] to {path}.")
     say("Start a new OMP session to reload modelRoles and retry.fallbackChains.")
@@ -947,9 +1122,13 @@ def main():
                 "agentModelOverrides": selected["task"]["agentModelOverrides"],
             },
         }))
+        if args.apply and not applied:
+            sys.exit(1)
         return
 
     print_dashboard(analysis, profiles)
+    if args.apply and not applied:
+        sys.exit(1)
     if not args.apply:
         print("\nTip: run `--apply` or `--profile", selected_name, "--apply` to write these changes.")
         print("The config path is `omp config path` (override with PI_CODING_AGENT_DIR).")
