@@ -20,6 +20,7 @@ from pathlib import Path
 
 _TOKEN = re.compile(r"[^a-z0-9]+")
 _CTX_TOKEN = re.compile(r"(?:^|[-_])\d+[km](?=$|[-_])")
+_ISO_DATE_TOKEN = re.compile(r"(?:^|[-_])((?:19|20)\d{2})[-_](\d{2})[-_](\d{2})(?=$|[-_])")
 _STAMP_TOKEN = re.compile(r"(?:^|[-_])((?:19|20)\d{6}|\d{3,4})(?=$|[-_])")
 _FAMILY = {
     "gemini": "gemini",
@@ -72,7 +73,7 @@ def load_catalog():
         raw = sys.stdin.read()
         if raw.strip():
             data = json.loads(raw)
-            models = data.get("models", data if isinstance(data, list) else [])
+            models = data.get("models", []) if isinstance(data, dict) else (data if isinstance(data, list) else [])
             if models:
                 return [_normalize_model(m) for m in models if m.get("provider") and m.get("id")]
     res = subprocess.run(
@@ -107,16 +108,20 @@ def _parts(text):
 def _revision(model):
     rev = (model.get("identity") or {}).get("revision")
     if rev:
-        parts = []
-        for piece in str(rev).split("."):
-            parts.append(int(piece) if piece.isdigit() else 0)
+        parts = [int(piece) for piece in re.split(r"[.\-_]+", str(rev)) if piece.isdigit()]
         while len(parts) < 3:
             parts.append(0)
         return tuple(parts[:3]) + (0,)
     mid = model["id"].lower()
-    stamps = [int(match.group(1)) for match in _STAMP_TOKEN.finditer(mid)]
+    stamps = [
+        int(f"{match.group(1)}{match.group(2)}{match.group(3)}")
+        for match in _ISO_DATE_TOKEN.finditer(mid)
+    ]
+    cleaned = _ISO_DATE_TOKEN.sub("", mid)
+    cleaned = _CTX_TOKEN.sub("", cleaned)
+    stamps.extend(int(match.group(1)) for match in _STAMP_TOKEN.finditer(cleaned))
     stamp = max(stamps) if stamps else 0
-    cleaned = _STAMP_TOKEN.sub("", _CTX_TOKEN.sub("", mid))
+    cleaned = _STAMP_TOKEN.sub("", cleaned)
     nums = [int(n) for n in re.findall(r"\d+", cleaned)[:3]]
     while len(nums) < 3:
         nums.append(0)
@@ -396,7 +401,7 @@ def covering_pools(provider, model, explicit):
     ]
     if named:
         return named
-    metered_families = explicit | (_METERED_FAMILIES - _provider_own_families(provider))
+    metered_families = (explicit | _METERED_FAMILIES) - _provider_own_families(provider)
     if families & metered_families:
         metered = [pool for pool in provider["pools"] if pool["kind"] == "metered"]
         if metered:
@@ -472,6 +477,14 @@ def _pick_composer(catalog, providers, explicit, fast):
     return {"model": model, "provider": provider, "pools": pools, "available": avail}
 
 
+def _flash_tier(pools):
+    if any(pool["kind"] == "named" for pool in pools):
+        return 0
+    if any(pool["kind"] in ("included", "general") for pool in pools):
+        return 1
+    return 2
+
+
 def _pick_flash(catalog, providers, explicit):
     found = []
     for provider in providers:
@@ -480,13 +493,13 @@ def _pick_flash(catalog, providers, explicit):
             continue
         pools = covering_pools(provider, model, explicit)
         avail = pool_available(pools)
-        named = 0 if any(pool["kind"] == "named" for pool in pools) else 1
-        found.append((0 if avail else 1, named, pool_pressure(pools), _revision(model), model, provider, pools, avail))
+        tier = _flash_tier(pools)
+        found.append((0 if avail else 1, tier, pool_pressure(pools), _revision(model), model, provider, pools, avail))
     if not found:
         return None
     found.sort(key=lambda item: (item[0], item[1], item[2], tuple(-part for part in item[3])))
-    _unavail, _named, _pressure, _rev, model, provider, pools, avail = found[0]
-    return {"model": model, "provider": provider, "pools": pools, "available": avail}
+    _unavail, tier, _pressure, _rev, model, provider, pools, avail = found[0]
+    return {"model": model, "provider": provider, "pools": pools, "available": avail, "metered": tier == 2}
 
 
 def _pick_haiku(catalog, providers, explicit):
@@ -653,7 +666,7 @@ def _dedup_role_chains(chains, roles, overrides):
     out = {}
     for target, hops in chains.items():
         assigned = primary.get(target)
-        filtered = [hop for hop in hops if hop and hop != assigned]
+        filtered = [hop for hop in hops if hop and hop != assigned and hop != target]
         if filtered:
             out[target] = filtered
     return out
@@ -737,40 +750,60 @@ def generate_profiles(analysis, catalog):
     fb_opus_bare = selector(fb["opus"]) if fb else None
     fb_sonnet_bare = selector(fb["sonnet"]) if fb else None
 
-    fast_routine = gem_sel or composer_fast_sel or haiku_sel or grok_med or generic_fast_sel or generic_med_sel
+    flash_routine_sel = None if (flash and flash["metered"] and composer_fast and composer_fast["available"]) else gem_sel
+    fast_routine = (
+        flash_routine_sel
+        or composer_fast_sel
+        or gem_sel
+        or haiku_sel
+        or grok_med
+        or generic_fast_sel
+        or generic_med_sel
+    )
     frontier = grok_high or slow_model or plan_model or generic_high_sel or fast_routine
     fallback_generic_fast = None if (grok_med or gem_sel or composer_fast_sel) else generic_fast_sel
     fallback_generic_high = None if (grok_high or slow_model or plan_model) else generic_high_sel
 
-    fallback_chains = {
-        "default": chain(grok_med, grok_prev_base, gem_sel, fallback_generic_fast),
-        "slow": chain(grok_high, grok_prev_high, composer_sel, gem_sel, fallback_generic_high),
-        "smol": chain(composer_fast_sel, haiku_sel, gem_sel, fallback_generic_fast),
-        "plan": chain(grok_high, grok_prev_high, composer_sel, gem_sel, fallback_generic_high),
-        grok_med: chain(grok_prev_base, composer_fast_sel, gem_sel),
-        grok_high: chain(grok_prev_high, composer_sel, gem_sel),
-        grok_xhigh: chain(grok_prev_xhigh, grok_high, gem_sel),
-        grok_prev_base: chain(composer_sel, gem_sel),
-        grok_prev_high: chain(composer_sel, gem_sel),
-        grok_prev_xhigh: chain(grok_high, gem_sel),
-        opus_high: chain(grok_xhigh, grok_high, gem_sel, fallback_generic_high),
-        opus_bare: chain(grok_xhigh, grok_high, gem_sel, fallback_generic_high),
-        sonnet_high: chain(grok_high, gem_sel, fallback_generic_high),
-        sonnet_bare: chain(grok_high, gem_sel, fallback_generic_high),
-        sonnet_prev_high: chain(grok_high, gem_sel, fallback_generic_high),
-        sonnet_prev_bare: chain(grok_high, gem_sel, fallback_generic_high),
-        opus_prev_bare: chain(grok_xhigh, gem_sel, fallback_generic_high),
-        fb_opus_high: chain(grok_xhigh, grok_high, gem_sel, fallback_generic_high),
-        fb_opus_bare: chain(grok_xhigh, grok_high, gem_sel, fallback_generic_high),
-        fb_sonnet_high: chain(grok_high, gem_sel, fallback_generic_high),
-        fb_sonnet_bare: chain(grok_high, gem_sel, fallback_generic_high),
-        "reviewer": chain(grok_high, gem_sel, fallback_generic_high),
-        "security-reviewer": chain(grok_xhigh, gem_sel, fallback_generic_high),
-        # A named-pool model must not fall through to the same id on a metered
-        # pool (that spends a different provider's paid bucket).
-        gem_sel: chain(grok_med, composer_fast_sel),
-        gem_high: chain(grok_high, composer_sel),
-    }
+    fallback_chains = {}
+
+    def add_chain(target, *hops):
+        if not target:
+            return
+        items = [hop for hop in chain(*hops) if hop != target]
+        if not items:
+            return
+        if target not in fallback_chains:
+            fallback_chains[target] = items
+        else:
+            fallback_chains[target] = chain(*fallback_chains[target], *items)
+
+    add_chain("default", grok_med, grok_prev_base, gem_sel, fallback_generic_fast)
+    add_chain("slow", grok_high, grok_prev_high, composer_sel, gem_sel, fallback_generic_high)
+    add_chain("smol", composer_fast_sel, haiku_sel, gem_sel, fallback_generic_fast)
+    add_chain("plan", grok_high, grok_prev_high, composer_sel, gem_sel, fallback_generic_high)
+    add_chain(grok_med, grok_prev_base, composer_fast_sel, gem_sel)
+    add_chain(grok_high, grok_prev_high, composer_sel, gem_sel)
+    add_chain(grok_xhigh, grok_prev_xhigh, grok_high, gem_sel)
+    add_chain(grok_prev_base, composer_sel, gem_sel)
+    add_chain(grok_prev_high, composer_sel, gem_sel)
+    add_chain(grok_prev_xhigh, grok_high, gem_sel)
+    add_chain(opus_high, grok_xhigh, grok_high, gem_sel, fallback_generic_high)
+    add_chain(opus_bare, grok_xhigh, grok_high, gem_sel, fallback_generic_high)
+    add_chain(sonnet_high, grok_high, gem_sel, fallback_generic_high)
+    add_chain(sonnet_bare, grok_high, gem_sel, fallback_generic_high)
+    add_chain(sonnet_prev_high, grok_high, gem_sel, fallback_generic_high)
+    add_chain(sonnet_prev_bare, grok_high, gem_sel, fallback_generic_high)
+    add_chain(opus_prev_bare, grok_xhigh, gem_sel, fallback_generic_high)
+    add_chain(fb_opus_high, grok_xhigh, grok_high, gem_sel, fallback_generic_high)
+    add_chain(fb_opus_bare, grok_xhigh, grok_high, gem_sel, fallback_generic_high)
+    add_chain(fb_sonnet_high, grok_high, gem_sel, fallback_generic_high)
+    add_chain(fb_sonnet_bare, grok_high, gem_sel, fallback_generic_high)
+    add_chain("reviewer", grok_high, gem_sel, fallback_generic_high)
+    add_chain("security-reviewer", grok_xhigh, gem_sel, fallback_generic_high)
+    # A named-pool model must not fall through to the same id on a metered
+    # pool (that spends a different provider's paid bucket).
+    add_chain(gem_sel, grok_med, composer_fast_sel)
+    add_chain(gem_high, grok_high, composer_sel)
     for provider in providers:
         if any(pool["kind"] == "named" for pool in provider["pools"]):
             prefix = f"{provider['id']}/"
