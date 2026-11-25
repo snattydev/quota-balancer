@@ -87,11 +87,17 @@ function runBalancer(
 	let settled = false;
 	let killTimer: ReturnType<typeof setTimeout> | undefined;
 
+	function clearKillTimer(): void {
+		if (killTimer) {
+			clearTimeout(killTimer);
+			killTimer = undefined;
+		}
+	}
+
 	function finish(code: number): void {
 		if (settled) return;
 		settled = true;
 		clearTimeout(timer);
-		if (killTimer) clearTimeout(killTimer);
 		resolve({ code, stdout, stderr });
 	}
 
@@ -109,6 +115,7 @@ function runBalancer(
 				// Ignore if already exited.
 			}
 		}, 2_000);
+		killTimer.unref?.();
 		finish(124);
 	}, timeoutMs);
 
@@ -118,11 +125,18 @@ function runBalancer(
 	child.stderr.on("data", (chunk: Buffer) => {
 		stderr += chunk.toString();
 	});
+	child.stdin.on("error", () => {
+		// Child may fail to spawn or close stdin early (EPIPE).
+	});
 	child.on("error", (err) => {
+		clearKillTimer();
 		stderr = `${stderr}${stderr ? "\n" : ""}${String(err)}`;
 		finish(1);
 	});
-	child.on("close", (code) => finish(code ?? 1));
+	child.on("close", (code) => {
+		clearKillTimer();
+		finish(code ?? 1);
+	});
 	try {
 		child.stdin.end(catalog);
 	} catch {
@@ -233,7 +247,12 @@ export default function (pi: ExtensionAPI) {
 		ctx: { ui?: Ui; models?: { list?: () => CatalogModel[] } },
 		options: { apply: boolean; announce: boolean },
 	): Promise<void> {
-		if (running) return;
+		if (running) {
+			if (options.announce) {
+				ctx.ui?.notify?.("Quota refresh already in progress.", "info");
+			}
+			return;
+		}
 		running = true;
 		const ui = ctx.ui;
 		ui?.setStatus?.(
